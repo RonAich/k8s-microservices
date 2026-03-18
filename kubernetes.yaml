@@ -1,0 +1,260 @@
+# =============================================================================
+# task-tracker — Kubernetes Manifests
+# Target: Minikube (single-node) / any standard K8s cluster
+# Apply:  kubectl apply -f kubernetes.yaml
+# =============================================================================
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. REDIS — Deployment
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels:
+    app: redis
+    tier: cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+        tier: cache
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.2-alpine          # Alpine = minimal attack surface
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          # Redis ships a built-in ping command — use it directly as a probe.
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # Redis needs /data for AOF / RDB
+            runAsNonRoot: true
+            runAsUser: 999                  # redis user baked into the official image
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. REDIS — Service (ClusterIP — internal only)
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+  labels:
+    app: redis
+    tier: cache
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      protocol: TCP
+      port: 6379
+      targetPort: 6379
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. APP — ConfigMap  (non-secret runtime config)
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: task-tracker-config
+  labels:
+    app: task-tracker
+data:
+  # Must match the Service name above — K8s DNS resolves it automatically
+  # within the same namespace as <service-name>.<namespace>.svc.cluster.local
+  REDIS_HOST: "redis-service"
+  REDIS_PORT: "6379"
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. APP — Deployment
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: task-tracker
+  labels:
+    app: task-tracker
+    tier: api
+spec:
+  replicas: 3                              # HA baseline; HPA takes over from here
+
+  selector:
+    matchLabels:
+      app: task-tracker
+
+  # ── Rolling-update strategy ────────────────────────────────────────────────
+  # At most 1 pod unavailable and at most 1 extra pod during a rollout.
+  # This means a 3-replica deployment is always serving at least 2 pods.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+
+  template:
+    metadata:
+      labels:
+        app: task-tracker
+        tier: api
+
+    spec:
+      # ── Pod-level security context ─────────────────────────────────────────
+      # Matches the non-root appuser created in the Dockerfile.
+      # UID 1001 is the typical value assigned to the first --system user
+      # added after root (UID 0) and the redis user (UID 999).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001                      # Ensures volume mounts are group-writable
+
+      # ── Graceful termination ───────────────────────────────────────────────
+      # Gives in-flight requests 30 s to complete before SIGKILL.
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: task-tracker
+          # Replace with your real image, e.g. your-dockerhub-user/task-tracker:1.0.0
+          image: task-tracker:latest
+          imagePullPolicy: IfNotPresent    # Use local Minikube image cache
+
+          ports:
+            - containerPort: 8000
+              name: http
+
+          # ── Environment from ConfigMap ────────────────────────────────────
+          envFrom:
+            - configMapRef:
+                name: task-tracker-config
+
+          # ── Resource management ───────────────────────────────────────────
+          resources:
+            requests:
+              cpu: "50m"                   # Guaranteed slice the scheduler reserves
+              memory: "64Mi"
+            limits:
+              cpu: "100m"                  # Hard cap; process is throttled, not killed
+              memory: "128Mi"              # Hard cap; OOMKill if exceeded
+
+          # ── Liveness probe ────────────────────────────────────────────────
+          # Answers: "Is this container still alive?"
+          # Failure action: kubelet RESTARTS the container.
+          # Delay of 15 s gives uvicorn time to bind and connect to Redis
+          # before the first check.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3           # 3 consecutive failures → restart
+
+          # ── Readiness probe ───────────────────────────────────────────────
+          # Answers: "Is this container ready to accept traffic?"
+          # Failure action: pod is REMOVED from the Service's endpoint list
+          # (no traffic routed to it) but NOT restarted.
+          # Shorter period (10 s) catches Redis blips faster than liveness.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3           # 3 consecutive failures → pull from rotation
+
+          # ── Container-level security context ─────────────────────────────
+          securityContext:
+            allowPrivilegeEscalation: false   # Cannot gain more privileges via setuid
+            readOnlyRootFilesystem: true       # Immutable filesystem; hardened posture
+            capabilities:
+              drop:
+                - ALL                          # Drop every Linux capability
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. HORIZONTAL POD AUTOSCALER
+# ─────────────────────────────────────────────────────────────────────────────
+# Prerequisite: metrics-server must be running.
+# Enable on Minikube with: minikube addons enable metrics-server
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: task-tracker-hpa
+  labels:
+    app: task-tracker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: task-tracker
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70           # Scale out when avg CPU > 70 % of *request*
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30      # React to spikes quickly (default is 0)
+      policies:
+        - type: Pods
+          value: 2                         # Add at most 2 pods per scaling event
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300     # Wait 5 min before scaling in — avoids flapping
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. APP — Service (NodePort — externally accessible via Minikube)
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: task-tracker-service
+  labels:
+    app: task-tracker
+    tier: api
+spec:
+  type: NodePort
+  selector:
+    app: task-tracker
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80              # ClusterIP port (internal)
+      targetPort: 8000      # Container port (uvicorn)
+      nodePort: 30080       # Exposed on every node; access via minikube ip:30080

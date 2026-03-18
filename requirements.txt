@@ -1,0 +1,9 @@
+# ── Web framework ────────────────────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.30.1          # includes httptools + uvloop for performance
+
+# ── Redis async client ───────────────────────────────────────────────────────
+redis==5.0.4                       # ships redis.asyncio out of the box
+
+# ── Data validation (FastAPI dependency) ─────────────────────────────────────
+pydantic==2.7.1
